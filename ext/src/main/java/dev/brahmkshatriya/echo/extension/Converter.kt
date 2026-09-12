@@ -737,8 +737,8 @@ fun Format.show(
     hasPremium: Boolean, supportsPlayPlay: Boolean, showWidevineStreams: Boolean,
 ) = when (this) {
     Format.FLAC_FLAC, Format.FLAC_FLAC_24BIT, Format.OGG_VORBIS_320 -> hasPremium && supportsPlayPlay
-    Format.OGG_VORBIS_160 -> supportsPlayPlay
-    Format.OGG_VORBIS_96 -> supportsPlayPlay
+    Format.OGG_VORBIS_160 -> supportsPlayPlay || (!supportsPlayPlay && !showWidevineStreams)
+    Format.OGG_VORBIS_96 -> supportsPlayPlay || !showWidevineStreams
     Format.MP4_256 -> hasPremium && showWidevineStreams
     Format.MP4_128 -> showWidevineStreams
     else -> false
@@ -779,7 +779,9 @@ fun BatchedExtensionResponse.toTrack(
 
     val streamables = mutableListOf<Streamable>()
     audioFiles?.filesList?.forEach {
-        it.takeIf { it.file.format.show(hasPremium, supportsPlayPlay, showWidevineStreams) }
+        val fmt = it.file.format
+        val passes = fmt.show(hasPremium, supportsPlayPlay, showWidevineStreams)
+        it.takeIf { passes }
             ?.let { audio ->
                 val file = audio.file
                 val formatName = file.format.name

@@ -48,9 +48,11 @@ import dev.brahmkshatriya.echo.extension.spotify.AudioFormat.FLAC_FLAC_24BIT
 import dev.brahmkshatriya.echo.extension.spotify.AudioFormat.OGG_VORBIS_160
 import dev.brahmkshatriya.echo.extension.spotify.AudioFormat.OGG_VORBIS_320
 import dev.brahmkshatriya.echo.extension.spotify.AudioFormat.OGG_VORBIS_96
+import dev.brahmkshatriya.echo.extension.spotify.DealerClient
 import dev.brahmkshatriya.echo.extension.spotify.Json
 import dev.brahmkshatriya.echo.extension.spotify.Queries
 import dev.brahmkshatriya.echo.extension.spotify.SpotifyApi
+import dev.brahmkshatriya.echo.extension.spotify.SpotifyLog
 import dev.brahmkshatriya.echo.extension.spotify.WebPlayerConfig
 import dev.brahmkshatriya.echo.extension.spotify.models.AccountAttributes
 import dev.brahmkshatriya.echo.extension.spotify.models.ArtistOverview
@@ -106,6 +108,8 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     open val filesDir = File("spotify")
     val api by lazy { SpotifyApi() }
     val queries by lazy { Queries(api) }
+    /** Dealer WebSocket client for obtaining Widevine MP4 file IDs. */
+    private val dealer by lazy { DealerClient(api) }
 
     override val webViewRequest = object : WebViewRequest.Cookie<List<User>> {
         override val dontCache = true
@@ -134,12 +138,14 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     }
 
     override fun setLoginUser(user: User?) {
+        SpotifyLog.d("setLoginUser() called: user=${user?.id}, hasCookie=${user?.extras?.containsKey("cookie")}")
         val cookie = if (user == null) null
         else user.extras["cookie"] ?: throw ClientException.Unauthorized(user.id)
         api.setCookie(cookie)
         api.setUser(user?.id)
         this.user = user
         this.product = null
+        SpotifyLog.d("setLoginUser() cookie set: ${if (cookie != null) "PRESENT (${cookie.take(20)}...)" else "NULL"}")
     }
 
     private var user: User? = null
@@ -223,35 +229,101 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     override suspend fun loadStreamableMedia(
         streamable: Streamable, isDownload: Boolean,
     ): Streamable.Media {
-        return when (streamable.type) {
-            Streamable.MediaType.Server -> {
-                api.cookie ?: throw ClientException.LoginRequired()
-                val format = streamable.extras["formatNum"]!!.toInt()
-                when (format) {
-                    OGG_VORBIS_320, OGG_VORBIS_160, OGG_VORBIS_96, FLAC_FLAC, FLAC_FLAC_24BIT -> oggStream(format.toString(), streamable)
-                    //MP4_256, MP4_128 -> widevineStream(streamable)
-                    else -> throw ClientException.NotSupported(AudioFormat.name(format))
+        SpotifyLog.d("loadStreamableMedia() called: id=${streamable.id}, type=${streamable.type}, extras=${streamable.extras}")
+        try {
+            val res = when (streamable.type) {
+                Streamable.MediaType.Server -> {
+                    if (api.cookie == null) {
+                        SpotifyLog.e("loadStreamableMedia: api.cookie is null! User not logged in!")
+                        throw ClientException.LoginRequired()
+                    }
+                    val format = streamable.extras["formatNum"]?.toIntOrNull()
+                    SpotifyLog.d("loadStreamableMedia() Server format=$format (${if (format != null) AudioFormat.name(format) else "null"})")
+                    when (format) {
+                        OGG_VORBIS_320, OGG_VORBIS_160, OGG_VORBIS_96, FLAC_FLAC, FLAC_FLAC_24BIT -> oggStream(format.toString(), streamable)
+                        AudioFormat.MP4_256, AudioFormat.MP4_128 -> widevineStream(streamable)
+                        else -> throw ClientException.NotSupported(if (format != null) AudioFormat.name(format) else "null")
+                    }
                 }
+
+                Streamable.MediaType.Background ->
+                    Streamable.Media.Background(streamable.id.toGetRequest())
+
+                else -> throw IllegalStateException("Unsupported Streamable : $streamable")
             }
-
-            Streamable.MediaType.Background ->
-                Streamable.Media.Background(streamable.id.toGetRequest())
-
-            else -> throw IllegalStateException("Unsupported Streamable : $streamable")
+            SpotifyLog.d("loadStreamableMedia() successfully prepared media: $res")
+            return res
+        } catch (t: Throwable) {
+            SpotifyLog.e("FATAL in loadStreamableMedia() for streamable id=${streamable.id}", t)
+            throw t
         }
     }
 
-    open val showWidevineStreams = false
+    open val showWidevineStreams = true
+    /** Set to true in subclasses that have a PlayPlay key provider (unplayplay). */
+    open val supportsPlayPlay = false
 
     override suspend fun loadTrack(track: Track, isDownload: Boolean): Track = coroutineScope {
-        val hasPremium = hasPremium()
-        val canvas =
-            if (showCanvas) async { queries.canvas(track.id).json.toStreamable() } else null
-        queries.extendedMetadata(track.id).toTrack(
-            hasPremium, true, showWidevineStreams, canvas?.await()
-        ).copy(
-            isExplicit = track.isExplicit
-        )
+        SpotifyLog.d("loadTrack() started: id=${track.id}, title=${track.title}")
+        try {
+            val hasPremium = runCatching { hasPremium() }.getOrElse { e ->
+                SpotifyLog.e("hasPremium() check failed", e)
+                false
+            }
+            SpotifyLog.d("loadTrack() hasPremium=$hasPremium, showWidevineStreams=$showWidevineStreams")
+
+            val canvas = if (showCanvas) async {
+                runCatching { queries.canvas(track.id).json.toStreamable() }.getOrNull()
+            } else null
+
+            SpotifyLog.d("loadTrack() fetching extendedMetadata for ${track.id}...")
+            val extMeta = queries.extendedMetadata(track.id)
+            SpotifyLog.d("loadTrack() extendedMetadata fetched successfully!")
+
+            val base = extMeta.toTrack(
+                hasPremium, supportsPlayPlay, showWidevineStreams, canvas?.await()
+            ).copy(
+                isExplicit = track.isExplicit
+            )
+            SpotifyLog.d("loadTrack() base track converted: streamables count=${base.streamables.size}")
+
+            if (!showWidevineStreams) {
+                SpotifyLog.d("showWidevineStreams is false, returning base track")
+                return@coroutineScope base
+            }
+
+            // Fetch Widevine MP4_128 file ID from the Dealer WebSocket
+            SpotifyLog.d("Requesting Widevine MP4 file ID from DealerClient for ${track.id}...")
+            val fileId = runCatching { dealer.getFileIdForTrack(track.id) }.getOrElse { e ->
+                SpotifyLog.e("Failed to get file ID from Dealer for ${track.id}", e)
+                null
+            }
+
+            if (fileId == null) {
+                SpotifyLog.d("No file ID received for ${track.id}, returning base track")
+                return@coroutineScope base
+            }
+
+            SpotifyLog.d("Successfully resolved fileId=$fileId for ${track.id} (MP4_128)")
+            val mp4Streamable = Streamable(
+                id = fileId,
+                quality = AudioFormat.quality(AudioFormat.MP4_128),
+                type = Streamable.MediaType.Server,
+                title = AudioFormat.name(AudioFormat.MP4_128),
+                extras = mapOf(
+                    "fileId"    to fileId,
+                    "formatNum" to AudioFormat.MP4_128.toString(),
+                    "formatName" to AudioFormat.name(AudioFormat.MP4_128)
+                )
+            )
+            val nonServer = base.streamables.filter { it.type != Streamable.MediaType.Server }
+            val result = base.copy(streamables = listOf(mp4Streamable) + nonServer)
+            SpotifyLog.d("loadTrack() completed! Total streamables=${result.streamables.size}, primary=${result.streamables.firstOrNull()}")
+            result
+        } catch (t: Throwable) {
+            SpotifyLog.e("FATAL in loadTrack() for ${track.id}", t)
+            throw t
+        }
     }
 
     private suspend fun createRadio(id: String): Radio {
@@ -647,25 +719,44 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
 
     override suspend fun loadLyrics(lyrics: Lyrics) = lyrics
 
-    /*private suspend fun widevineStream(streamable: Streamable): Streamable.Media.Server {
+    private suspend fun widevineStream(streamable: Streamable): Streamable.Media {
+        SpotifyLog.d("widevineStream() started for fileId=${streamable.id}")
         val accessToken = api.getWebAccessToken()
-        val url = queries.storageResolve(streamable.id).json.cdnUrl.first()
-        val time = "time=${System.currentTimeMillis()}"
-        val decryption = Streamable.Decryption.Widevine(
-            "https://spclient.wg.spotify.com/widevine-license/v1/audio/license?$time"
-                .toGetRequest(
-                    mapOf(
-                        "Authorization" to "Bearer $accessToken",
-                        "Origin" to "https://open.spotify.com",
-                    )
-                ),
-            true
+        runCatching { api.clientTokenManager.ensureValid() }
+        val clientToken = api.clientTokenManager.clientToken
+        val format = streamable.extras["formatNum"]!!
+        val url = queries.storageResolve(format, streamable.id).json.cdnUrl.first()
+        SpotifyLog.d("widevineStream() resolved CDN URL: $url")
+        val headers = mutableMapOf(
+            "Authorization" to "Bearer $accessToken",
+            "Origin" to WebPlayerConfig.ORIGIN,
+            "Referer" to WebPlayerConfig.REFERER,
+            "User-Agent" to WebPlayerConfig.USER_AGENT,
+            "App-Platform" to WebPlayerConfig.APP_PLATFORM,
+            "spotify-app-version" to WebPlayerConfig.appVersion,
+            "Accept" to "*/*"
         )
+        if (!clientToken.isNullOrBlank()) {
+            headers["client-token"] = clientToken
+        }
+        if (!api.cookie.isNullOrBlank()) {
+            headers["Cookie"] = api.cookie!!
+        }
+        val decryption = Streamable.Decryption.Widevine(
+            NetworkRequest(
+                url = "https://spclient.wg.spotify.com/widevine-license/v1/audio/license",
+                headers = headers,
+                method = NetworkRequest.Method.POST,
+                bodyBase64 = null
+            ),
+            isMultiSession = true
+        )
+        SpotifyLog.d("widevineStream() Widevine decryption configured (isMultiSession=true, POST, hasClientToken=${!clientToken.isNullOrBlank()})")
         return Streamable.Source.Http(
             request = url.toGetRequest(),
             decryption = decryption,
         ).toMedia()
-    }*/
+    }
 
     open suspend fun getKey(json: Json, accessToken: String, fileId: String): ByteArray =
         throw IllegalStateException()

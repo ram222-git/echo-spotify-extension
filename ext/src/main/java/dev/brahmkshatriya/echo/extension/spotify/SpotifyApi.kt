@@ -6,8 +6,10 @@ import dev.brahmkshatriya.echo.common.settings.Settings
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -37,7 +39,7 @@ class SpotifyApi {
     }
 
     val isDesktopPersona: Boolean
-        get() = !_cookie.isNullOrBlank()
+        get() = web.clientId == DesktopConfig.CLIENT_ID
 
     fun deviceId(): String {
         cachedDeviceId?.let { return it }
@@ -81,6 +83,37 @@ class SpotifyApi {
                     if (desktop) DesktopConfig.appVersion else WebPlayerConfig.appVersion,
                 )
             }
+
+            chain.proceed(builder.build())
+        }
+        .build()
+
+    /**
+     * A dedicated client that always sends Web Player (browser-like) headers regardless of persona.
+     * Used for endpoints like storage-resolve that Spotify expects to look like a browser request
+     * (product=9, platform=39 = web player). Using Desktop headers on these endpoints causes
+     * server errors even when logged in with sp_dc.
+     */
+    val webPlayerClient = OkHttpClient.Builder()
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val builder = request.newBuilder()
+
+            // Always apply web/browser headers — act like open.spotify.com in a desktop browser
+            applyWebHeaders(builder)
+
+            if (request.header("Accept") == null) {
+                builder.header("Accept", "application/json")
+            }
+
+            web.accessToken?.let {
+                if (request.header("Authorization") == null)
+                    builder.header("Authorization", "Bearer $it")
+            }
+            clientTokenManager.clientToken?.let {
+                builder.header("client-token", it)
+            }
+            builder.header("spotify-app-version", WebPlayerConfig.appVersion)
 
             chain.proceed(builder.build())
         }
@@ -148,6 +181,36 @@ class SpotifyApi {
         return Response(json.decode<T>(raw), raw)
     }
 
+    /**
+     * Like [clientQuery] but always uses [webPlayerClient] (browser-like headers).
+     * Use this for endpoints that Spotify expects to originate from a web browser,
+     * such as storage-resolve (product=9, platform=39).
+     */
+    suspend inline fun <reified T> clientQueryWeb(path: String): Response<T> {
+        ensureTokens()
+        val request = Request.Builder()
+            .url("https://spclient.wg.spotify.com/$path")
+            .build()
+        val response = webPlayerClient.newCall(request).await()
+        val raw = response.body.string()
+        if (!raw.startsWith('{') && !raw.startsWith('[')) {
+            throw Exception("Invalid response: $raw")
+        }
+        return Response(json.decode<T>(raw), raw)
+    }
+
+    @PublishedApi
+    internal suspend fun ensureTokens() {
+        runCatching {
+            webMutex.withLock { web.getToken() }
+            clientTokenManager.ensureValid()
+        }.getOrElse {
+            val id = userId
+            if (id != null && it is TokenManagerDesktop.Error) throw ClientException.Unauthorized(id)
+            throw it
+        }
+    }
+
     suspend inline fun <reified T> clientMutate(path: String, data: JsonObject): Response<T> {
         val raw = callGetBody(
             Request.Builder()
@@ -202,14 +265,7 @@ class SpotifyApi {
     }
 
     suspend fun callGetBody(request: Request): String {
-        runCatching {
-            webMutex.withLock { web.getToken() }
-            clientTokenManager.ensureValid()
-        }.getOrElse {
-            val id = userId
-            if (id != null && it is TokenManagerDesktop.Error) throw ClientException.Unauthorized(id)
-            throw it
-        }
+        ensureTokens()
         val response = call(request).body.string()
         return if (response.startsWith('{')) response else {
             throw Exception("Invalid response: $response")
@@ -217,15 +273,8 @@ class SpotifyApi {
     }
 
     suspend fun callGetBodyBytes(request: Request): ByteArray {
-        runCatching {
-            webMutex.withLock { web.getToken() }
-            clientTokenManager.ensureValid()
-        }.getOrElse {
-            val id = userId
-            if (id != null && it is TokenManagerDesktop.Error) throw ClientException.Unauthorized(id)
-            throw it
-        }
-        val response = call(request)
+        ensureTokens()
+        val response = webPlayerClient.newCall(request).await()
         return if (!response.isSuccessful) {
             throw RuntimeException(
                 "Extended metadata request failed: ${response.code} ${response.message}"
@@ -258,6 +307,109 @@ class SpotifyApi {
 
     suspend fun getWebAccessToken(): String {
         return webMutex.withLock { web.getToken() }
+    }
+
+    /**
+     * Register this device with Spotify Connect State, linking it to the given
+     * Dealer WebSocket connection. After this, the server will push player state
+     * (including Widevine manifests) to our WebSocket connection.
+     */
+    /**
+     * Register this device with Spotify Connect State as an observer device (`hobs_$deviceId`),
+     * linking it to the Dealer WebSocket connection.
+     */
+    suspend fun connectStateRegister(connectionId: String, deviceId: String) {
+        ensureTokens()
+        val body = buildJsonObject {
+            put("member_type", "CONNECT_STATE")
+            putJsonObject("device") {
+                putJsonObject("device_info") {
+                    putJsonObject("capabilities") {
+                        put("can_be_player", false)
+                        put("hidden", true)
+                        put("needs_full_player_state", true)
+                    }
+                }
+            }
+        }
+        val request = Request.Builder()
+            .url("https://spclient.wg.spotify.com/connect-state/v1/devices/hobs_$deviceId")
+            .header("X-Spotify-Connection-Id", connectionId)
+            .header("Accept", "application/json")
+            .put(body.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        webPlayerClient.newCall(request).await().closeQuietly()
+
+        // Also register player device via track-playback/v1/devices
+        runCatching {
+            val tpBody = buildJsonObject {
+                putJsonObject("device") {
+                    put("brand", "spotify")
+                    putJsonObject("capabilities") {
+                        put("change_volume", true)
+                        put("enable_play_token", true)
+                        put("supports_file_media_type", true)
+                        put("disable_connect", false)
+                        put("audio_podcasts", true)
+                        put("video_playback", true)
+                        putJsonArray("manifest_formats") {
+                            add("file_ids_mp4")
+                            add("file_ids_mp4_dual")
+                            add("file_urls_mp3")
+                            add("file_ids_mp3")
+                        }
+                    }
+                    put("device_id", deviceId)
+                    put("device_type", "computer")
+                    put("model", "web_player")
+                    put("name", "Web Player (Chrome)")
+                    put("platform_name", "web_player")
+                }
+                put("connection_id", connectionId)
+                put("client_version", "harmony:4.9.0-af0ef98814")
+                put("volume", 65535)
+            }
+            val tpRequest = Request.Builder()
+                .url("https://spclient.wg.spotify.com/track-playback/v1/devices")
+                .header("Accept", "application/json")
+                .post(tpBody.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+            webPlayerClient.newCall(tpRequest).await().closeQuietly()
+        }
+    }
+
+    /**
+     * Send a "play" player command via Connect State.
+     * The server will respond by pushing a replace_state message via Dealer WebSocket
+     * that includes the track manifest (file_ids_mp4 with Widevine file IDs).
+     */
+    suspend fun connectStateLoad(trackUri: String, deviceId: String) {
+        ensureTokens()
+        val body = buildJsonObject {
+            putJsonObject("command") {
+                put("endpoint", "play")
+                putJsonObject("context") {
+                    put("uri", trackUri)
+                    put("url", "context://$trackUri")
+                    putJsonObject("metadata") {}
+                }
+                putJsonObject("play_origin") {
+                    put("feature_identifier", "harmony")
+                    put("feature_version", "4.9.0-af0ef98814")
+                }
+                putJsonObject("options") {
+                    put("license", "on-demand")
+                    putJsonObject("skip_to") {}
+                    putJsonObject("player_options_override") {}
+                }
+            }
+        }
+        val request = Request.Builder()
+            .url("https://spclient.wg.spotify.com/connect-state/v1/player/command/from/$deviceId/to/$deviceId")
+            .header("Accept", "application/json")
+            .post(body.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        webPlayerClient.newCall(request).await().closeQuietly()
     }
 
     var userId: String? = null

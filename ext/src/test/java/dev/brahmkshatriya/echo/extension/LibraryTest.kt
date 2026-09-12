@@ -4,12 +4,15 @@ import dev.brahmkshatriya.echo.common.models.Album
 import dev.brahmkshatriya.echo.common.models.Artist
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.loadAll
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.pagedDataOfFirst
+import dev.brahmkshatriya.echo.common.models.NetworkRequest
 import dev.brahmkshatriya.echo.common.models.Playlist
 import dev.brahmkshatriya.echo.common.models.Shelf
+import dev.brahmkshatriya.echo.common.models.Streamable
 import dev.brahmkshatriya.echo.common.models.Tab
 import dev.brahmkshatriya.echo.common.models.Track
 import dev.brahmkshatriya.echo.common.models.User
 import dev.brahmkshatriya.echo.extension.spotify.Base62
+import dev.brahmkshatriya.echo.extension.spotify.models.Metadata4Track
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
@@ -19,6 +22,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import kotlinx.serialization.json.Json
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.junit.After
 import org.junit.Assert
 import org.junit.Before
@@ -30,7 +35,7 @@ class LibraryTest {
     private val extension = SpotifyExtension()
 
     private val mainThreadSurrogate = newSingleThreadContext("UI thread")
-    private val cookie = ""
+    private val cookie = "sp_dc="
     private val user = User(
         "", "",
         extras = mapOf("cookie" to cookie, "stored_token" to "{\"username\":\"\",\"token\":\"\"}")
@@ -59,11 +64,54 @@ class LibraryTest {
     }
 
     @Test
-    fun testCurrentUser() = testIn("Testing current user") {
+    fun testCurrentUser() = testIn("Testing Dealer WebSocket & Widevine playback") {
         val user = extension.getCurrentUser()
-        println(user)
-        println(extension.queries.extendedMetadata("spotify:track:0rVjrie60R2vHEla6eVTOj"))
+        println("User: $user")
+
+        val track1 = Track(id = "spotify:track:3Hp5UfErvtHw0SlkRPHkf9", title = "IYKYK")
+        println("Loading Track 1: ${track1.title}...")
+        println("Token clientId: ${extension.api.web.clientId}")
+        val loaded1 = extension.loadTrack(track1, false)
+        println("Token clientId after load: ${extension.api.web.clientId}")
+        val streamable1 = loaded1.streamables.firstOrNull { it.type == Streamable.MediaType.Server }
+        checkNotNull(streamable1) { "No server streamable returned for track 1!" }
+        println("✅ Track 1 MP4 streamable: id=${streamable1.id}, quality=${streamable1.quality}, extras=${streamable1.extras}")
+
+        val media1 = extension.loadStreamableMedia(streamable1, false) as Streamable.Media.Server
+        val source = media1.sources.first() as Streamable.Source.Http
+        val cdnUrl = source.request.url
+        println("CDN URL: $cdnUrl")
+
+        // Inspect CDN file size via HTTP HEAD / GET
+        val req = okhttp3.Request.Builder().url(cdnUrl).head().build()
+        val resp = extension.api.client.newCall(req).execute()
+        println("CDN Response Code: ${resp.code}")
+        println("CDN Content-Length: ${resp.header("Content-Length")} bytes")
+        println("CDN Accept-Ranges: ${resp.header("Accept-Ranges")}")
+        println("CDN Content-Type: ${resp.header("Content-Type")}")
+
+        println("Decryption: ${source.decryption}")
+        val widevine = source.decryption as Streamable.Decryption.Widevine
+        Assert.assertEquals(true, widevine.isMultiSession)
+        Assert.assertEquals(NetworkRequest.Method.POST, widevine.license.method)
+        Assert.assertEquals("https://spclient.wg.spotify.com/widevine-license/v1/audio/license", widevine.license.url)
+        Assert.assertTrue(widevine.license.headers.containsKey("Authorization"))
+        Assert.assertTrue(widevine.license.headers.containsKey("Cookie"))
     }
+
+    @Test
+    fun testTrackDurations() = testIn("Testing Track Info") {
+        for (id in listOf(
+            "spotify:track:4CZl2BQkGPIFK99cf6jTAz", // Low Fade
+            "spotify:track:3Hp5UfErvtHw0SlkRPHkf9", // IYKYK
+            "spotify:track:6NK0r2uRTDVRjFM8mlienL"  // Shikari
+        )) {
+            val t = extension.loadTrack(Track(id, ""), false)
+            println("Track: ${t.id} - ${t.title} - duration: ${t.duration} ms (${(t.duration ?: 0) / 1000}s)")
+            println("Streamables: ${t.streamables.map { "${it.title}: ${it.extras}" }}")
+        }
+    }
+
 
     private suspend fun Shelf.print() {
         when (this) {

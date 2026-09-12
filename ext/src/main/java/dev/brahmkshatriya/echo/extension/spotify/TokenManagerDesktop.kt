@@ -31,11 +31,17 @@ class TokenManagerDesktop(
         private set
     private var tokenExpiration: Long = 0
 
-    private suspend fun createAnonymousAccessToken(): String {
+    suspend fun createWebAccessToken(spDc: String? = null): String {
         val request = Request.Builder()
             .url(getAnonymousTokenUrl())
             .header("User-Agent", WebPlayerConfig.USER_AGENT)
             .header("Referer", WebPlayerConfig.REFERER)
+            .header("Origin", WebPlayerConfig.ORIGIN)
+            .apply {
+                if (!spDc.isNullOrBlank()) {
+                    header("Cookie", "sp_dc=$spDc")
+                }
+            }
             .build()
         client.newCall(request).await().use { response ->
             val body = response.body.string()
@@ -48,9 +54,14 @@ class TokenManagerDesktop(
             accessToken = token.accessToken
             clientId = token.clientId
             tokenExpiration = token.accessTokenExpirationTimestampMs - 5 * 60 * 1000
+            SpotifyLog.d("Web Player access token generated! isAnonymous=${token.isAnonymous}, clientId=${token.clientId}")
             fetchWebAppVersion()
             return accessToken!!
         }
+    }
+
+    private suspend fun createAnonymousAccessToken(): String {
+        return createWebAccessToken(null)
     }
 
     @OptIn(ExperimentalStdlibApi::class)
@@ -67,14 +78,11 @@ class TokenManagerDesktop(
 
     @OptIn(ExperimentalEncodingApi::class)
     private suspend fun getDataFromSite(): Secret {
-        val string = client.newCall(
-            Request.Builder()
-                .url(secretsUrl)
-                .header("User-Agent", WebPlayerConfig.USER_AGENT)
-                .build()
-        ).await().body.string()
-        val (secret, version) = json.decode<Secret>(string)
-        return Secret(convertToHex(secret), version)
+        // Active live secret extracted from web-player.js
+        return Secret(
+            convertToHex(",7/*F(\"rLJ2oxaKL^f+E1xvP@N"),
+            61
+        )
     }
 
     companion object {
@@ -435,13 +443,19 @@ class TokenManagerDesktop(
             ?: throw IllegalStateException("$step returned an empty body")
     }
 
-    suspend fun getToken() =
-        if (accessToken == null || !isTokenWorking(tokenExpiration)) {
-            val spDc = getSpDc()
+    suspend fun getToken(): String {
+        if (accessToken != null && isTokenWorking(tokenExpiration)) {
+            return accessToken!!
+        }
+        val spDc = getSpDc()
+        return runCatching {
+            createWebAccessToken(spDc)
+        }.getOrElse { e ->
+            SpotifyLog.e("Failed to create Web Player access token, falling back to desktop", e)
             if (spDc.isNullOrBlank()) createAnonymousAccessToken()
             else createDesktopAccessToken(spDc)
         }
-        else accessToken!!
+    }
 
     private suspend fun fetchWebAppVersion() {
         runCatching {

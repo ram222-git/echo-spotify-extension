@@ -240,16 +240,16 @@ class Queries(
         }
     )
 
-    /*suspend fun metadata4Track(id: String) = run {
+    suspend fun metadata4Track(id: String) = run {
         val gid = Base62.decode(id.substringAfter("spotify:track:"))
-        api.clientQuery<Metadata4Track>("metadata/4/track/$gid")
-    }*/
+        api.clientQueryWeb<Metadata4Track>("metadata/4/track/$gid?market=from_token")
+    }
 
     suspend fun extendedMetadata(id: String) = run {
         api.clientMutateProto("extended-metadata/v0/extended-metadata", id)
     }
 
-    suspend fun storageResolve(format: String, id: String) = api.clientQuery<StorageResolve>(
+    suspend fun storageResolve(format: String, id: String) = api.clientQueryWeb<StorageResolve>(
         "storage-resolve/v2/files/audio/interactive/$format/$id?version=10000000&product=9&platform=39&alt=json"
     )
 
