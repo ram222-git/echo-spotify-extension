@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       NAME: Spotify Extension
       TAG: sp
@@ -24,6 +26,7 @@ jobs:
 
       - name: Cook Env
         run: |
+          mkdir -p app/build
           echo -e "## ${{ env.NAME }}\n${{ github.event.head_commit.message }}" > commit.txt
           version=$( echo ${{ github.event.head_commit.id }} | cut -c1-7 )
           echo "VERSION=v$version" >> $GITHUB_ENV
@@ -31,20 +34,12 @@ jobs:
           echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > $GITHUB_WORKSPACE/signing-key.jks
           chmod +x ./gradlew
 
-      - name: Download Dependency
-        shell: bash
-        env:
-          DEPENDENCY_URL: ${{ secrets.DEPENDENCY_URL }}
-        run: |
-          mkdir -p app/libs
-          curl -L -o app/libs/unplayplay.aar ${{ env.DEPENDENCY_URL }}
-
       - name: Build with Gradle
         run: |
-          ./gradlew assembleRelease \
+          ./gradlew assembleRelease shadowJar \
           -Pandroid.injected.signing.store.file=$GITHUB_WORKSPACE/signing-key.jks \
           -Pandroid.injected.signing.store.password=${{ secrets.PASSWORD }} \
-          -Pandroid.injected.signing.key.alias=key0 \
+          -Pandroid.injected.signing.key.alias=${{ secrets.KEY_ALIAS || 'key0' }} \
           -Pandroid.injected.signing.key.password=${{ secrets.PASSWORD }}
           
           cp app/build/outputs/apk/release/app-release.apk ${{ env.APP_PATH }}
@@ -61,18 +56,22 @@ jobs:
           tag_name: ${{ env.VERSION }}
           body_path: commit.txt
           name: ${{ env.VERSION }}
-          files: ${{ env.APP_PATH }}
+          files: |
+            ${{ env.APP_PATH }}
+            ext/build/libs/*.jar
 
       - name: Delete Old Releases
         uses: sgpublic/delete-release-action@master
+        continue-on-error: true
         with:
           release-drop: true
-          release-keep-count: 3
+          release-keep-count: 5
           release-drop-tag: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload APK to Discord
+        if: ${{ env.WEBHOOK != '' }}
         shell: bash
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
@@ -84,6 +83,7 @@ jobs:
           ${{ env.WEBHOOK }}
 
       - name: Upload APK to Telegram
+        if: ${{ env.BOT_ID != '' && env.CHANNEL_ID != '' }}
         shell: bash
         env:
           BOT_ID: ${{ secrets.TELEGRAM_BOT_ID }}
