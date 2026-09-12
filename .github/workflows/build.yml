@@ -35,12 +35,18 @@ jobs:
           chmod +x ./gradlew
 
       - name: Build with Gradle
+        env:
+          SIGNING_PASSWORD: ${{ secrets.PASSWORD }}
+          SIGNING_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
+          ALIAS="${SIGNING_ALIAS:-key0}"
+          ALIAS=$(echo "$ALIAS" | tr -d '\r\n')
+          PASS=$(echo "$SIGNING_PASSWORD" | tr -d '\r\n')
           ./gradlew assembleRelease shadowJar \
-          -Pandroid.injected.signing.store.file=$GITHUB_WORKSPACE/signing-key.jks \
-          -Pandroid.injected.signing.store.password=${{ secrets.PASSWORD }} \
-          -Pandroid.injected.signing.key.alias=${{ secrets.KEY_ALIAS || 'key0' }} \
-          -Pandroid.injected.signing.key.password=${{ secrets.PASSWORD }}
+            -Pandroid.injected.signing.store.file="$GITHUB_WORKSPACE/signing-key.jks" \
+            -Pandroid.injected.signing.store.password="$PASS" \
+            -Pandroid.injected.signing.key.alias="$ALIAS" \
+            -Pandroid.injected.signing.key.password="$PASS"
           
           cp app/build/outputs/apk/release/app-release.apk ${{ env.APP_PATH }}
 
